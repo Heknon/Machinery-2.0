@@ -1,4 +1,4 @@
-package me.oriharel.machinery.structure
+package me.oriharel.machinery.structure.schematic
 
 import com.google.gson.Gson
 import com.google.gson.JsonObject

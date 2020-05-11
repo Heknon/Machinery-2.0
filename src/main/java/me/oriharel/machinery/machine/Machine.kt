@@ -2,7 +2,7 @@ package me.oriharel.machinery.machine
 
 import me.oriharel.machinery.Buildable
 import me.oriharel.machinery.OwnableStructure
-import me.oriharel.machinery.structure.Schematic
+import me.oriharel.machinery.structure.schematic.Schematic
 import org.bukkit.Bukkit
 import org.bukkit.Location
 import org.bukkit.inventory.Inventory

@@ -1,6 +1,7 @@
 package me.oriharel.machinery.structure
 
 import me.oriharel.machinery.Machinery
+import me.oriharel.machinery.structure.schematic.Schematic
 import me.oriharel.machinery.utilities.extensions.execute
 import java.nio.file.Path
 
@@ -22,7 +23,7 @@ class StructureBuilder(private val machinery: Machinery, private val structures:
     }
 
     fun registerStructure(key: String, schematic: Path, async: Boolean = false, callback: ((Unit) -> Unit)? = null) = execute(async, machinery, callback) {
-        registerStructure(key, Schematic(schematic))
+        registerStructure(key, Schematic(machinery, schematic))
     }
 
     fun registerStructure(key: String, schematic: Schematic, async: Boolean = false, callback: ((Unit) -> Unit)? = null) {

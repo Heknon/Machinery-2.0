@@ -1,9 +1,8 @@
 package me.oriharel.machinery.structure
 
 
+import me.oriharel.machinery.structure.schematic.Schematic
 import org.bukkit.Location
-import org.bukkit.Material
-import org.bukkit.entity.Player
 
 /**
  * Used to abstract the logic of building a schematic.

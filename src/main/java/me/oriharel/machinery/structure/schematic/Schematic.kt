@@ -1,7 +1,10 @@
-package me.oriharel.machinery.structure
+package me.oriharel.machinery.structure.schematic
 
-import me.oriharel.machinery.utilities.schedulers.Scheduler
+import me.oriharel.machinery.utilities.extensions.contextualForEach
 import me.oriharel.machinery.utilities.extensions.next
+import me.oriharel.machinery.utilities.extensions.scheduledIteration
+import me.oriharel.machinery.utilities.schedulers.IterativeScheduler
+import me.oriharel.machinery.utilities.schedulers.Scheduler
 import net.minecraft.server.v1_15_R1.NBTCompressedStreamTools
 import net.minecraft.server.v1_15_R1.NBTTagCompound
 import net.minecraft.server.v1_15_R1.NBTTagList
@@ -30,12 +33,42 @@ class Schematic constructor(val plugin: JavaPlugin, val schematic: Path) {
     private lateinit var blocks: MutableMap<Int, BlockData>
     private lateinit var blockData: ByteArray
     private lateinit var dimensions: SchematicDimensions
-    private lateinit var scheduler: Scheduler<Location, Unit>
+    private lateinit var scheduler: Scheduler<Location, Int, Unit>
     private var chests: Map<Vector, MutableList<IndexedInventoryItem>>? = null
     private val signsInSchematic: MutableMap<Vector, List<String>> = HashMap()
 
 
-    fun buildSchematic(buildLocation: Location, builder: Player? = null, placeBlockEvery: Long) {
+    fun buildSchematic(
+            buildLocation: Location,
+            builder: Player? = null,
+            placeBlockEveryDefault: Long = 20,
+            placeBlockEvery: (Int, Location?, Scheduler<Location, Int, Unit>) -> Long,
+            blockPlacedCallback: (Location.(Unit, Scheduler<Location, Int, Unit>) -> Unit)? = null,
+            buildingFinishedCallback: ((Scheduler<Location, Int, Unit>) -> Unit)? = null,
+            vararg option: SchematicOption
+    ): BuildResult {
+        return buildSchematic(
+                buildLocation,
+                builder,
+                placeBlockEveryDefault,
+                { ret, ctx ->
+                    if (ctx is IterativeScheduler<Location, Unit>)
+                        ctx.update(0, placeBlockEvery(ctx.currentItem?.index ?: 0, ctx.currentItem?.value, ctx))
+                    blockPlacedCallback?.invoke(this, ret, ctx)
+                },
+                buildingFinishedCallback,
+                *option
+        )
+    }
+
+    fun buildSchematic(
+            buildLocation: Location,
+            builder: Player? = null,
+            placeBlockEvery: Long = 20,
+            blockPlacedCallback: (Location.(Unit, Scheduler<Location, Int, Unit>) -> Unit)? = null,
+            buildingFinishedCallback: ((Scheduler<Location, Int, Unit>) -> Unit)? = null,
+            vararg option: SchematicOption
+    ): BuildResult {
         val width = dimensions.width.toInt()
         val height = dimensions.height.toInt()
         val length = dimensions.length.toInt()
@@ -77,6 +110,7 @@ class Schematic constructor(val plugin: JavaPlugin, val schematic: Path) {
         placementLocations.addAll(placementLocationsPlacedLast)
         placementLocationsPlacedLast.clear()
 
+        if (!validateBuildLocation(builder, placementLocations, *option)) return BuildResult(placementLocations, false)
 
         val blocksToUpdateAfterPaste: MutableList<Block> = mutableListOf()
 
@@ -88,6 +122,21 @@ class Schematic constructor(val plugin: JavaPlugin, val schematic: Path) {
                 blocksToUpdateAfterPaste.add(block)
         }
 
+        scheduler = placementLocations.scheduledIteration<Location, Unit>(plugin, placeBlockEvery) { index, _ ->
+            blockPlacementRoutine(
+                    builderFacing,
+                    block,
+                    dimensions.getBlockData(indices[index]),
+                    locationsWithNBTData,
+                    index
+            )
+        }.setOnSingleTaskComplete { ret, ctx ->
+            blockPlacedCallback?.invoke(this, ret, ctx)
+        }.setOnRepeatComplete {
+            buildingFinishedCallback?.invoke(this)
+        }
+
+        return BuildResult(placementLocations, true)
     }
 
     private fun blockPlacementRoutine(builderFacing: BlockFace, block: Block, blockDataToBePlaced: BlockData, locationsWithNBTData: Map<Int, Any?>, index: Int) {
@@ -227,6 +276,36 @@ class Schematic constructor(val plugin: JavaPlugin, val schematic: Path) {
         else -> null
     }
 
+    /**
+     * @return true if can build schematic, otherwise, false
+     */
+    private fun validateBuildLocation(builder: Player? = null, locationsToValidate: MutableSet<Location>, vararg options: SchematicOption): Boolean {
+        if (options.contains(SchematicOption.OVERWRITE_BLOCKS) && !options.contains(SchematicOption.BUILD_PREVIEW)) {
+            return true
+        }
+
+        val validatedLocations: MutableSet<Location> = mutableSetOf()
+        val showPreview = options.contains(SchematicOption.BUILD_PREVIEW)
+        val limeGlassData = Material.LIME_STAINED_GLASS.createBlockData()
+        val airData = Material.AIR.createBlockData()
+
+        locationsToValidate.contextualForEach {
+            if (block.isPassable) {
+                if (showPreview) {
+                    builder?.sendBlockChange(this, limeGlassData)
+                }
+                validatedLocations.add(this)
+            } else {
+                validatedLocations.forEach {
+                    builder?.sendBlockChange(it, airData)
+                }
+                return false
+            }
+        }
+
+        return true
+    }
+
 
     private fun Player.getDirection(): BlockFace {
         var yaw = location.yaw
@@ -283,6 +362,26 @@ class Schematic constructor(val plugin: JavaPlugin, val schematic: Path) {
         }
     }
 
+    data class BuildResult(val blockLocations: Set<Location>, val success: Boolean)
+
+    private inner class SchematicDimensions(val width: Short, val height: Short, val length: Short) {
+        internal fun getBlockIndex(x: Int, y: Int, z: Int): Int {
+            return (y * width * length) + (z * width) + x
+        }
+
+        internal fun getBlockData(x: Int, y: Int, z: Int): BlockData {
+            return getBlockData(getBlockIndex(x, y, z))
+        }
+
+        internal fun getBlockData(index: Int): BlockData {
+            return blocks[blockData[index].toInt()]!!
+        }
+    }
+
+    enum class Direction(val face: BlockFace) {
+        NORTH(BlockFace.NORTH), EAST(BlockFace.EAST), SOUTH(BlockFace.SOUTH), WEST(BlockFace.WEST);
+    }
+
     private val multiDirectionalMaterials: Set<Material> = setOf(
             Material.STONE_BRICK_WALL,
             Material.BRICK_WALL,
@@ -299,9 +398,6 @@ class Schematic constructor(val plugin: JavaPlugin, val schematic: Path) {
             Material.RED_SANDSTONE_WALL,
             Material.SANDSTONE_WALL
     )
-
-    private val fenceTagValues: Set<Material> = Tag.FENCES.values
-
     private val signMaterials: Set<Material> = setOf(
             Material.SPRUCE_SIGN,
             Material.DARK_OAK_SIGN,
@@ -310,6 +406,9 @@ class Schematic constructor(val plugin: JavaPlugin, val schematic: Path) {
             Material.JUNGLE_SIGN,
             Material.OAK_SIGN
     )
+
+    private val fenceTagValues: Set<Material> = Tag.FENCES.values
+
     private val wallSignMaterials: Set<Material> = setOf(
             Material.SPRUCE_WALL_SIGN,
             Material.DARK_OAK_WALL_SIGN,
@@ -318,11 +417,12 @@ class Schematic constructor(val plugin: JavaPlugin, val schematic: Path) {
             Material.JUNGLE_WALL_SIGN,
             Material.OAK_WALL_SIGN
     )
+
+
     private val chestMaterials: Set<Material> = setOf(
             Material.CHEST,
             Material.TRAPPED_CHEST
     )
-
     private val blocksPlacedLast: Set<Material> = setOf(
             Material.LAVA,
             Material.WATER,
@@ -438,26 +538,6 @@ class Schematic constructor(val plugin: JavaPlugin, val schematic: Path) {
 
             *multiDirectionalMaterials.toTypedArray()
     )
-
-
-    enum class Direction(val face: BlockFace) {
-        NORTH(BlockFace.NORTH), EAST(BlockFace.EAST), SOUTH(BlockFace.SOUTH), WEST(BlockFace.WEST);
-    }
-
-
-    private inner class SchematicDimensions(val width: Short, val height: Short, val length: Short) {
-        internal fun getBlockIndex(x: Int, y: Int, z: Int): Int {
-            return (y * width * length) + (z * width) + x
-        }
-
-        internal fun getBlockData(x: Int, y: Int, z: Int): BlockData {
-            return getBlockData(getBlockIndex(x, y, z))
-        }
-
-        internal fun getBlockData(index: Int): BlockData {
-            return blocks[blockData[index].toInt()]!!
-        }
-    }
 }
 
 private enum class NBTMaterial {

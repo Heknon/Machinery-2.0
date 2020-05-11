@@ -1,6 +1,6 @@
 package me.oriharel.machinery
 
-import me.oriharel.machinery.structure.Schematic
+import me.oriharel.machinery.structure.schematic.Schematic
 import java.util.*
 
 interface OwnableStructure {
