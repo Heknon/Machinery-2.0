@@ -3,5 +3,7 @@ version: ${project.version}
 main: me.oriharel.machinery.Machinery
 api-version: 1.13
 authors: [Heknon]
+depend:
+  - Kotlin
 description: Adds machines. Factorio in Minecraft
 website: https://oriharel.me
