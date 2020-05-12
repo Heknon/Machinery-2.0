@@ -16,7 +16,7 @@ fun <T, A> T.execute(async: Boolean, plugin: JavaPlugin? = null, callback: ((A) 
     return this
 }
 
-inline fun <T> Iterable<T>.contextualForEach(action: T.() -> Unit) {
+inline fun <T> Iterable<T>.forEachContextual(action: T.() -> Unit) {
     for (i in this) {
         action(i)
     }

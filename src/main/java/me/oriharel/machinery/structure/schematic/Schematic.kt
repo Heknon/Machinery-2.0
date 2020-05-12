@@ -1,6 +1,6 @@
 package me.oriharel.machinery.structure.schematic
 
-import me.oriharel.machinery.utilities.extensions.contextualForEach
+import me.oriharel.machinery.utilities.extensions.forEachContextual
 import me.oriharel.machinery.utilities.extensions.next
 import me.oriharel.machinery.utilities.extensions.scheduledIteration
 import me.oriharel.machinery.utilities.schedulers.IterativeScheduler
@@ -8,17 +8,12 @@ import me.oriharel.machinery.utilities.schedulers.Scheduler
 import net.minecraft.server.v1_15_R1.NBTCompressedStreamTools
 import net.minecraft.server.v1_15_R1.NBTTagCompound
 import net.minecraft.server.v1_15_R1.NBTTagList
-import org.bukkit.Bukkit
-import org.bukkit.Location
-import org.bukkit.Material
-import org.bukkit.Tag
-import org.bukkit.block.Block
-import org.bukkit.block.BlockFace
-import org.bukkit.block.Chest
-import org.bukkit.block.Sign
+import org.bukkit.*
+import org.bukkit.block.*
 import org.bukkit.block.data.BlockData
 import org.bukkit.block.data.Directional
 import org.bukkit.block.data.MultipleFacing
+import org.bukkit.block.data.type.Fence
 import org.bukkit.block.data.type.WallSign
 import org.bukkit.craftbukkit.libs.org.apache.commons.lang3.EnumUtils
 import org.bukkit.entity.Player
@@ -28,24 +23,37 @@ import java.io.FileInputStream
 import java.nio.file.Path
 import java.util.*
 
+typealias BuildTask = Scheduler<Location, Int, Unit>
 
+/**
+ * This class provides the ability to build schematics.
+ * Lots of features are provided. One of the main features is the fact that a server can restart and upon loading the server
+ * the schematic will keep on building.
+ * This behavior is allowed by the fact that a schematic's runtime data is either stored
+ * in the first block with state it has built or if no such block has been encountered, it is stored in a folder named
+ * schematicsInProgress in the appropriate world folder. Schematics which have encountered a "stateful" block will place most
+ * of their data in the block however there will still be a file named "schematicsInProgress.dat" which will store the locations
+ * to the stateful blocks as Longs. This file will be located in the appropriate world folder.
+ */
 class Schematic constructor(val plugin: JavaPlugin, val schematic: Path) {
     private lateinit var blocks: MutableMap<Int, BlockData>
     private lateinit var blockData: ByteArray
     private lateinit var dimensions: SchematicDimensions
-    private lateinit var scheduler: Scheduler<Location, Int, Unit>
     private var chests: Map<Vector, MutableList<IndexedInventoryItem>>? = null
     private val signsInSchematic: MutableMap<Vector, List<String>> = HashMap()
 
 
-    fun buildSchematic(
+    /**
+     * Used when you want to have the time between each block placed changed while executing.
+     */
+    fun buildSchematicEvaluatedTime(
             buildLocation: Location,
             builder: Player? = null,
             placeBlockEveryDefault: Long = 20,
-            placeBlockEvery: (Int, Location?, Scheduler<Location, Int, Unit>) -> Long,
-            blockPlacedCallback: (Location.(Unit, Scheduler<Location, Int, Unit>) -> Unit)? = null,
-            buildingFinishedCallback: ((Scheduler<Location, Int, Unit>) -> Unit)? = null,
-            vararg option: SchematicOption
+            blockPlacedCallback: (Location.(Unit, BuildTask) -> Unit)? = null,
+            buildingFinishedCallback: ((BuildTask) -> Unit)? = null,
+            options: Set<SchematicOption> = setOf(),
+            placeBlockEveryEvaluator: (Int, Location?, BuildTask) -> Long
     ): BuildResult {
         return buildSchematic(
                 buildLocation,
@@ -53,11 +61,12 @@ class Schematic constructor(val plugin: JavaPlugin, val schematic: Path) {
                 placeBlockEveryDefault,
                 { ret, ctx ->
                     if (ctx is IterativeScheduler<Location, Unit>)
-                        ctx.update(0, placeBlockEvery(ctx.currentItem?.index ?: 0, ctx.currentItem?.value, ctx))
+                        ctx.update(period = 0, delay = placeBlockEveryEvaluator(ctx.currentItem?.index
+                                ?: 0, ctx.currentItem?.value, ctx))
                     blockPlacedCallback?.invoke(this, ret, ctx)
                 },
                 buildingFinishedCallback,
-                *option
+                *options.toTypedArray()
         )
     }
 
@@ -65,8 +74,8 @@ class Schematic constructor(val plugin: JavaPlugin, val schematic: Path) {
             buildLocation: Location,
             builder: Player? = null,
             placeBlockEvery: Long = 20,
-            blockPlacedCallback: (Location.(Unit, Scheduler<Location, Int, Unit>) -> Unit)? = null,
-            buildingFinishedCallback: ((Scheduler<Location, Int, Unit>) -> Unit)? = null,
+            blockPlacedCallback: (Location.(Unit, BuildTask) -> Unit)? = null,
+            buildingFinishedCallback: ((BuildTask) -> Unit)? = null,
             vararg option: SchematicOption
     ): BuildResult {
         val width = dimensions.width.toInt()
@@ -122,7 +131,7 @@ class Schematic constructor(val plugin: JavaPlugin, val schematic: Path) {
                 blocksToUpdateAfterPaste.add(block)
         }
 
-        scheduler = placementLocations.scheduledIteration<Location, Unit>(plugin, placeBlockEvery) { index, _ ->
+        placementLocations.scheduledIteration<Location, Unit>(plugin, placeBlockEvery) { index, _ ->
             blockPlacementRoutine(
                     builderFacing,
                     block,
@@ -131,12 +140,72 @@ class Schematic constructor(val plugin: JavaPlugin, val schematic: Path) {
                     index
             )
         }.setOnSingleTaskComplete { ret, ctx ->
+
+            if (option.contains(SchematicOption.PLAY_DEFAULT_SOUND))
+                block.location.world?.playEffect(block.location, Effect.STEP_SOUND, block.type)
+
+            if (option.contains(SchematicOption.SUMMON_DEFAULT_PARTICLES))
+                block.location.world?.spawnParticle(Particle.CLOUD, block.location, 6)
+
             blockPlacedCallback?.invoke(this, ret, ctx)
+
         }.setOnRepeatComplete {
+            buildFinalizationRoutine(blocksToUpdateAfterPaste)
+            schematicBuildingFinishedCleanupRoutine()
             buildingFinishedCallback?.invoke(this)
         }
 
         return BuildResult(placementLocations, true)
+    }
+
+    fun loadSchematic(): Schematic {
+        val fis = FileInputStream(schematic.toFile())
+        val nbt: NBTTagCompound = NBTCompressedStreamTools.a(fis)
+
+        dimensions = SchematicDimensions(nbt.getShort("Width"), nbt.getShort("Height"), nbt.getShort("Length"))
+        blockData = nbt.getByteArray("BlockData")
+
+        val palette = nbt.getCompound("Palette")
+        val tiles = nbt["BlockEntities"] as NBTTagList?
+        var currentTile = 0
+
+        if (tiles != null) {
+            repeat(tiles.size) {
+                val compound = tiles.getCompound(currentTile)
+                if (compound.isEmpty) return@repeat
+
+                val id = compound.getString("Id").replace("minecraft:", "").toUpperCase()
+                if (EnumUtils.isValidEnum(NBTMaterial::class.java, id) && NBTMaterial.valueOf(id) == NBTMaterial.SIGN) {
+                    val lines: MutableList<String> = ArrayList()
+                    val pos = compound.getIntArray("Pos")
+
+                    lines.add(compound.getSignLineFromNBT("Text1") ?: "")
+                    lines.add(compound.getSignLineFromNBT("Text2") ?: "")
+                    lines.add(compound.getSignLineFromNBT("Text3") ?: "")
+                    lines.add(compound.getSignLineFromNBT("Text4") ?: "")
+
+                    if (lines.isNotEmpty()) signsInSchematic[Vector(pos[0], pos[1], pos[2])] = lines
+
+                    tiles.removeAt(currentTile)
+                }
+                currentTile++
+            }
+            try {
+                chests = tiles.getItemsFromNBT()
+            } catch (e: RuntimeException) {
+                //it wasn't a chest
+            }
+        }
+
+        blocks = mutableMapOf()
+        palette.keys.forEach {
+            val id = palette.getInt(it)
+            val blockData = Bukkit.createBlockData(it)
+            blocks[id] = blockData
+        }
+
+        fis.close()
+        return this
     }
 
     private fun blockPlacementRoutine(builderFacing: BlockFace, block: Block, blockDataToBePlaced: BlockData, locationsWithNBTData: Map<Int, Any?>, index: Int) {
@@ -193,54 +262,41 @@ class Schematic constructor(val plugin: JavaPlugin, val schematic: Path) {
 
     }
 
-    fun loadSchematic(): Schematic {
-        val fis = FileInputStream(schematic.toFile())
-        val nbt: NBTTagCompound = NBTCompressedStreamTools.a(fis)
+    private fun buildFinalizationRoutine(blocksToUpdate: List<Block>) {
+        blocksToUpdate.forEach {
+            val state: BlockState = it.state
 
-        dimensions = SchematicDimensions(nbt.getShort("Width"), nbt.getShort("Height"), nbt.getShort("Length"))
-        blockData = nbt.getByteArray("BlockData")
+            if (!fenceTagValues.contains(it.type)) {
+                it.state.update(true, false)
+                return@forEach
+            }
 
-        val palette = nbt.getCompound("Palette")
-        val tiles = nbt["BlockEntities"] as NBTTagList?
-        var currentTile = 0
+            val fence: Fence = state.blockData as Fence
+            fence.allowedFaces.forEach { face ->
+                val relative: Block = it.getRelative(face)
+                val relativeTypeAsString = relative.type.toString()
 
-        if (tiles != null) {
-            repeat(tiles.size) {
-                val compound = tiles.getCompound(currentTile)
-                if (compound.isEmpty) return@repeat
-
-                val id = compound.getString("Id").replace("minecraft:", "").toUpperCase()
-                if (EnumUtils.isValidEnum(NBTMaterial::class.java, id) && NBTMaterial.valueOf(id) == NBTMaterial.SIGN) {
-                    val lines: MutableList<String> = ArrayList()
-                    val pos = compound.getIntArray("Pos")
-
-                    lines.add(compound.getSignLineFromNBT("Text1") ?: "")
-                    lines.add(compound.getSignLineFromNBT("Text2") ?: "")
-                    lines.add(compound.getSignLineFromNBT("Text3") ?: "")
-                    lines.add(compound.getSignLineFromNBT("Text4") ?: "")
-
-                    if (lines.isNotEmpty()) signsInSchematic[Vector(pos[0], pos[1], pos[2])] = lines
-
-                    tiles.removeAt(currentTile)
+                if (relative.type == Material.AIR || relativeTypeAsString.contains("SLAB") || relativeTypeAsString.contains("STAIRS")) {
+                    fence.setFace(face, false)
+                } else if (!relativeTypeAsString.contains("SLAB")
+                        && !relativeTypeAsString.contains("STAIRS")
+                        && !anvilMaterials.contains(relative.type)
+                        && relative.type.isSolid
+                        && relative.type.isBlock
+                        && !fence.hasFace(face)) {
+                    fence.setFace(face, true)
                 }
-                currentTile++
             }
-            try {
-                chests = tiles.getItemsFromNBT()
-            } catch (e: RuntimeException) {
-                //it wasn't a chest
-            }
-        }
 
-        blocks = mutableMapOf()
-        palette.keys.forEach {
-            val id = palette.getInt(it)
-            val blockData = Bukkit.createBlockData(it)
-            blocks[id] = blockData
+            state.blockData = fence
+            state.update(true, false)
         }
+    }
 
-        fis.close()
-        return this
+
+    private fun schematicBuildingFinishedCleanupRoutine() {
+        // TODO: Logic to clear all files that might've been created by the schematic due to a server restart
+
     }
 
     private fun Location.getSchematicBlockLocation(
@@ -289,7 +345,7 @@ class Schematic constructor(val plugin: JavaPlugin, val schematic: Path) {
         val limeGlassData = Material.LIME_STAINED_GLASS.createBlockData()
         val airData = Material.AIR.createBlockData()
 
-        locationsToValidate.contextualForEach {
+        locationsToValidate.forEachContextual {
             if (block.isPassable) {
                 if (showPreview) {
                     builder?.sendBlockChange(this, limeGlassData)
@@ -362,9 +418,20 @@ class Schematic constructor(val plugin: JavaPlugin, val schematic: Path) {
         }
     }
 
+    /**
+     * Used to keep track of the state of a schematic of this type being built
+     * later on serialized if the server is restarted to keep the schematic building.
+     */
+    class SchematicState {
+        var scheduler: BuildTask? = null
+        var currentIndex: Int = 0
+        var builderFace = BlockFace.NORTH
+    }
+
     data class BuildResult(val blockLocations: Set<Location>, val success: Boolean)
 
     private inner class SchematicDimensions(val width: Short, val height: Short, val length: Short) {
+
         internal fun getBlockIndex(x: Int, y: Int, z: Int): Int {
             return (y * width * length) + (z * width) + x
         }
@@ -372,14 +439,14 @@ class Schematic constructor(val plugin: JavaPlugin, val schematic: Path) {
         internal fun getBlockData(x: Int, y: Int, z: Int): BlockData {
             return getBlockData(getBlockIndex(x, y, z))
         }
-
         internal fun getBlockData(index: Int): BlockData {
             return blocks[blockData[index].toInt()]!!
         }
-    }
 
+    }
     enum class Direction(val face: BlockFace) {
         NORTH(BlockFace.NORTH), EAST(BlockFace.EAST), SOUTH(BlockFace.SOUTH), WEST(BlockFace.WEST);
+
     }
 
     private val multiDirectionalMaterials: Set<Material> = setOf(
@@ -398,6 +465,13 @@ class Schematic constructor(val plugin: JavaPlugin, val schematic: Path) {
             Material.RED_SANDSTONE_WALL,
             Material.SANDSTONE_WALL
     )
+
+    private val anvilMaterials: Set<Material> = setOf(
+            Material.ANVIL,
+            Material.CHIPPED_ANVIL,
+            Material.DAMAGED_ANVIL
+    )
+
     private val signMaterials: Set<Material> = setOf(
             Material.SPRUCE_SIGN,
             Material.DARK_OAK_SIGN,
@@ -409,6 +483,7 @@ class Schematic constructor(val plugin: JavaPlugin, val schematic: Path) {
 
     private val fenceTagValues: Set<Material> = Tag.FENCES.values
 
+
     private val wallSignMaterials: Set<Material> = setOf(
             Material.SPRUCE_WALL_SIGN,
             Material.DARK_OAK_WALL_SIGN,
@@ -417,12 +492,11 @@ class Schematic constructor(val plugin: JavaPlugin, val schematic: Path) {
             Material.JUNGLE_WALL_SIGN,
             Material.OAK_WALL_SIGN
     )
-
-
     private val chestMaterials: Set<Material> = setOf(
             Material.CHEST,
             Material.TRAPPED_CHEST
     )
+
     private val blocksPlacedLast: Set<Material> = setOf(
             Material.LAVA,
             Material.WATER,

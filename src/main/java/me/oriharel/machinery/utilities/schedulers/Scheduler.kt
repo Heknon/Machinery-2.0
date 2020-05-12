@@ -26,21 +26,28 @@ abstract class Scheduler<T, P, R>(private val plugin: JavaPlugin, private var re
                 this.task = it
                 mounted = true
             }
+
             if (repeatedAmount >= repeatAmount) {
                 onRepeatComplete?.invoke(this, returnStore)
                 it.cancel()
                 return@Consumer
             }
             val returnedValue = taskExecutor(task, it)
-            returnStore.add(returnedValue)
-            singleTaskCompletedExecutor(onSingleTaskComplete, returnedValue, it)
+
+            if (!returnedValue.first) {
+                onRepeatComplete?.invoke(this, returnStore)
+                it.cancel()
+                return@Consumer
+            }
+            returnStore.add(returnedValue.second!!)
+            singleTaskCompletedExecutor(onSingleTaskComplete, returnedValue.second!!, it)
             repeatedAmount++
 
         }
         return this
     }
 
-    abstract fun taskExecutor(task: T.(P, Scheduler<T, P, R>) -> R, ctx: BukkitTask): R
+    abstract fun taskExecutor(task: T.(P, Scheduler<T, P, R>) -> R, ctx: BukkitTask): Pair<Boolean, R?>
     abstract fun singleTaskCompletedExecutor(singleTaskComplete: (T.(R, Scheduler<T, P, R>) -> Unit)?, returnedValue: R, ctx: BukkitTask)
 
     fun setOnSingleTaskComplete(singleTaskComplete: T.(R, Scheduler<T, P, R>) -> Unit): Scheduler<T, P, R> {
@@ -72,10 +79,8 @@ abstract class Scheduler<T, P, R>(private val plugin: JavaPlugin, private var re
     }
 
     fun run(): Scheduler<T, P, R> {
-        print("before: $this")
         Bukkit.getScheduler().runTaskTimer(plugin, taskConsumer
                 ?: throw RuntimeException("You must set a task!"), delay, period)
-        print("after: $this")
         return this
     }
 
