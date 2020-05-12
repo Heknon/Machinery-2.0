@@ -6,22 +6,26 @@ inline fun <reified T> T.getPrivateField(fieldName: String, setAsAccessible: Boo
     var clazz: Class<*> = T::class.java
 
     while (clazz != Object::class.java) {
-        val field: Field? = clazz.getDeclaredField(fieldName)
-        if (field == null) {
+        try {
+            val field: Field? = clazz.getDeclaredField(fieldName)
+            if (field == null) {
+                clazz = clazz.superclass
+                continue
+            }
+            if (setAsAccessible) field.isAccessible = true
+            return field
+        } catch (e: NoSuchFieldException) {
             clazz = clazz.superclass
             continue
         }
-
-        if (setAsAccessible) field.isAccessible = true
-        return field
     }
 
-    throw RuntimeException("Field not found!")
+    throw RuntimeException("Field $fieldName not found!")
 }
 
 inline fun <reified T, reified V> T.getPrivateFieldValue(fieldName: String): V? {
-    val field = getPrivateField(fieldName)
-    val value = field.get(fieldName)
+    val field = this.getPrivateField(fieldName)
+    val value = field.get(this)
     if (value !is V?) return null
     return value
 }

@@ -12,7 +12,7 @@ import java.util.function.Consumer
  */
 abstract class Scheduler<T, P, R>(private val plugin: JavaPlugin, private var repeatAmount: Long, internal var period: Long, private var delay: Long) {
     private var taskConsumer: Consumer<BukkitTask>? = null
-    var task: BukkitTask? = null
+    private var task: BukkitTask? = null
     private var onSingleTaskComplete: (T.(R, Scheduler<T, P, R>) -> Unit)? = null
     private var onRepeatComplete: (Scheduler<T, P, R>.(List<R>) -> Unit)? = null
     private var mounted = false

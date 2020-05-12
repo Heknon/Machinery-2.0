@@ -1,10 +1,9 @@
 package me.oriharel.machinery.structure.schematic
 
-import me.oriharel.machinery.utilities.extensions.forEachContextual
-import me.oriharel.machinery.utilities.extensions.next
-import me.oriharel.machinery.utilities.extensions.scheduledIteration
+import com.google.gson.GsonBuilder
+import com.google.gson.reflect.TypeToken
+import me.oriharel.machinery.utilities.extensions.*
 import me.oriharel.machinery.utilities.schedulers.IterativeScheduler
-import me.oriharel.machinery.utilities.schedulers.Scheduler
 import net.minecraft.server.v1_15_R1.NBTCompressedStreamTools
 import net.minecraft.server.v1_15_R1.NBTTagCompound
 import net.minecraft.server.v1_15_R1.NBTTagList
@@ -20,10 +19,11 @@ import org.bukkit.entity.Player
 import org.bukkit.plugin.java.JavaPlugin
 import org.bukkit.util.Vector
 import java.io.FileInputStream
+import java.io.Serializable
 import java.nio.file.Path
 import java.util.*
 
-typealias BuildTask = Scheduler<Location, Int, Unit>
+typealias BuildTask = IterativeScheduler<Location, Unit>
 
 /**
  * This class provides the ability to build schematics.
@@ -41,6 +41,13 @@ class Schematic constructor(val plugin: JavaPlugin, val schematic: Path) {
     private lateinit var dimensions: SchematicDimensions
     private var chests: Map<Vector, MutableList<IndexedInventoryItem>>? = null
     private val signsInSchematic: MutableMap<Vector, List<String>> = HashMap()
+    private val states: MutableSet<SchematicState> = mutableSetOf()
+    @Transient
+    private val gson = GsonBuilder()
+            .registerTypeHierarchyAdapter(ByteArray::class.java, ByteArrayToBase64TypeAdapter())
+            .registerTypeHierarchyAdapter(IterativeScheduler::class.java, BuildTaskTypeAdapter())
+            .registerTypeHierarchyAdapter(SchematicState::class.java, SchematicStateTypeAdapter())
+            .create()
 
 
     /**
@@ -72,19 +79,37 @@ class Schematic constructor(val plugin: JavaPlugin, val schematic: Path) {
 
     fun buildSchematic(
             buildLocation: Location,
-            builder: Player? = null,
+            builder: OfflinePlayer? = null,
             placeBlockEvery: Long = 20,
             blockPlacedCallback: (Location.(Unit, BuildTask) -> Unit)? = null,
             buildingFinishedCallback: ((BuildTask) -> Unit)? = null,
-            vararg option: SchematicOption
+            vararg options: SchematicOption
     ): BuildResult {
+        return buildSchematic(SchematicState(
+                buildLocation = buildLocation,
+                options = setOf(*options),
+                scheduler = null,
+                currentIndex = 0,
+                builder = builder?.uniqueId,
+                finishedBuilding = false,
+                placeBlockEvery = placeBlockEvery,
+                blockPlacedCallback = blockPlacedCallback,
+                buildingFinishedCallback = buildingFinishedCallback
+        ))
+    }
+
+    fun buildSchematic(
+            schematicState: SchematicState
+    ): BuildResult {
+        states.add(schematicState)
         val width = dimensions.width.toInt()
         val height = dimensions.height.toInt()
         val length = dimensions.length.toInt()
+        val builder: OfflinePlayer? = schematicState.builder?.toOfflinePlayer()
         val placementLocations: MutableSet<Location> = mutableSetOf()
         val placementLocationsPlacedLast: MutableSet<Location> = mutableSetOf()
         val locationsWithNBTData: MutableMap<Int, Any?> = mutableMapOf()
-        val builderFacing: BlockFace = builder?.getDirection() ?: BlockFace.NORTH
+        val builderFacing: BlockFace = builder?.player?.getDirection() ?: BlockFace.NORTH
         val indices: MutableList<Int> = mutableListOf()
         val indicesPlacedLast: MutableList<Int> = mutableListOf()
 
@@ -93,13 +118,13 @@ class Schematic constructor(val plugin: JavaPlugin, val schematic: Path) {
                 for (lengthCurr in 0 until length) {
                     val blockIndex = dimensions.getBlockIndex(widthCurr, heightCurr, lengthCurr)
                     val blockData = dimensions.getBlockData(widthCurr, heightCurr, lengthCurr)
-                    val location: Location = buildLocation.getSchematicBlockLocation(builderFacing, widthCurr, heightCurr, lengthCurr)!!
+                    val location: Location = schematicState.buildLocation.getSchematicBlockLocation(builderFacing, widthCurr, heightCurr, lengthCurr)!!
                     val point = Vector(widthCurr, heightCurr, lengthCurr)
 
 
                     val blockMaterial = blockData.material
                     if (blockMaterial != Material.AIR)
-                        if (!blocksPlacedLast.contains(blockMaterial)) {
+                        if (!BLOCKS_PLACED_LAST.contains(blockMaterial)) {
                             indices.add(blockIndex)
                             placementLocations.add(location)
                         } else {
@@ -119,7 +144,7 @@ class Schematic constructor(val plugin: JavaPlugin, val schematic: Path) {
         placementLocations.addAll(placementLocationsPlacedLast)
         placementLocationsPlacedLast.clear()
 
-        if (!validateBuildLocation(builder, placementLocations, *option)) return BuildResult(placementLocations, false)
+        if (!validateBuildLocation(builder, placementLocations, *schematicState.options.toTypedArray())) return BuildResult(placementLocations, false)
 
         val blocksToUpdateAfterPaste: MutableList<Block> = mutableListOf()
 
@@ -127,32 +152,45 @@ class Schematic constructor(val plugin: JavaPlugin, val schematic: Path) {
             val block = location.block
             val data = dimensions.getBlockData(i)
 
-            if (fenceTagValues.contains(data.material))
+            if (MaterialType.FENCE.materials.contains(data.material))
                 blocksToUpdateAfterPaste.add(block)
         }
 
-        placementLocations.scheduledIteration<Location, Unit>(plugin, placeBlockEvery) { index, _ ->
-            blockPlacementRoutine(
-                    builderFacing,
-                    block,
-                    dimensions.getBlockData(indices[index]),
-                    locationsWithNBTData,
-                    index
-            )
-        }.setOnSingleTaskComplete { ret, ctx ->
+        schematicState.finishedBuilding = true
+        if (schematicState.scheduler == null) {
+            schematicState.scheduler = placementLocations.removeUpTo(if (schematicState.currentIndex == 0) 0 else schematicState.currentIndex + 1)
+                    .scheduledIteration<Location, Unit>(plugin, schematicState.placeBlockEvery) { _, _ ->
+                        blockPlacementRoutine(
+                                builderFacing,
+                                block,
+                                dimensions.getBlockData(indices[schematicState.currentIndex]),
+                                locationsWithNBTData,
+                                schematicState.currentIndex
+                        ).also {
+                            if (schematicState.statefulBlockEncounterLocation != null && it.state !is TileState) return@also
+                            schematicState.statefulBlockEncounterLocation = it.location
+                        }
+                        schematicState.currentIndex++
+                    }.setOnSingleTaskComplete { ret, ctx ->
 
-            if (option.contains(SchematicOption.PLAY_DEFAULT_SOUND))
-                block.location.world?.playEffect(block.location, Effect.STEP_SOUND, block.type)
+                        if (schematicState.options.contains(SchematicOption.PLAY_DEFAULT_SOUND)) {
+                            block.location.world?.playEffect(block.location, Effect.STEP_SOUND, block.type)
+                        }
 
-            if (option.contains(SchematicOption.SUMMON_DEFAULT_PARTICLES))
-                block.location.world?.spawnParticle(Particle.CLOUD, block.location, 6)
+                        if (schematicState.options.contains(SchematicOption.SUMMON_DEFAULT_PARTICLES)) {
+                            block.location.world?.spawnParticle(Particle.CLOUD, block.location, 6)
+                        }
 
-            blockPlacedCallback?.invoke(this, ret, ctx)
+                        schematicState.blockPlacedCallback?.invoke(this, ret, ctx as BuildTask)
 
-        }.setOnRepeatComplete {
-            buildFinalizationRoutine(blocksToUpdateAfterPaste)
-            schematicBuildingFinishedCleanupRoutine()
-            buildingFinishedCallback?.invoke(this)
+                    }.setOnRepeatComplete {
+                        buildFinalizationRoutine(blocksToUpdateAfterPaste)
+                        schematicBuildingFinishedCleanupRoutine()
+                        schematicState.buildingFinishedCallback?.invoke(this as BuildTask)
+                        schematicState.destroy()
+                    } as BuildTask
+        } else {
+            schematicState.scheduler!!.run()
         }
 
         return BuildResult(placementLocations, true)
@@ -208,18 +246,18 @@ class Schematic constructor(val plugin: JavaPlugin, val schematic: Path) {
         return this
     }
 
-    private fun blockPlacementRoutine(builderFacing: BlockFace, block: Block, blockDataToBePlaced: BlockData, locationsWithNBTData: Map<Int, Any?>, index: Int) {
+    private fun blockPlacementRoutine(builderFacing: BlockFace, block: Block, blockDataToBePlaced: BlockData, locationsWithNBTData: Map<Int, Any?>, index: Int): Block {
         block.type = blockDataToBePlaced.material
         block.blockData = blockDataToBePlaced
 
         when (blockDataToBePlaced.material) {
-            in signMaterials -> {
+            in MaterialType.SIGN.materials -> {
                 handleSignBlockInfoUpdate<org.bukkit.block.data.type.Sign>(block, blockDataToBePlaced, locationsWithNBTData, index)
             }
-            in wallSignMaterials -> {
+            in MaterialType.WALL_SIGN.materials -> {
                 handleSignBlockInfoUpdate<WallSign>(block, blockDataToBePlaced, locationsWithNBTData, index)
             }
-            in chestMaterials -> {
+            in MaterialType.CHEST.materials -> {
                 val chestData = blockDataToBePlaced as org.bukkit.block.data.type.Chest
                 block.blockData = chestData
 
@@ -259,14 +297,14 @@ class Schematic constructor(val plugin: JavaPlugin, val schematic: Path) {
             block.blockData = blockDirectional
         }
         block.state.update(true, false)
-
+        return block
     }
 
     private fun buildFinalizationRoutine(blocksToUpdate: List<Block>) {
         blocksToUpdate.forEach {
             val state: BlockState = it.state
 
-            if (!fenceTagValues.contains(it.type)) {
+            if (!MaterialType.FENCE.materials.contains(it.type)) {
                 it.state.update(true, false)
                 return@forEach
             }
@@ -280,7 +318,7 @@ class Schematic constructor(val plugin: JavaPlugin, val schematic: Path) {
                     fence.setFace(face, false)
                 } else if (!relativeTypeAsString.contains("SLAB")
                         && !relativeTypeAsString.contains("STAIRS")
-                        && !anvilMaterials.contains(relative.type)
+                        && !MaterialType.ANVIL.materials.contains(relative.type)
                         && relative.type.isSolid
                         && relative.type.isBlock
                         && !fence.hasFace(face)) {
@@ -297,6 +335,43 @@ class Schematic constructor(val plugin: JavaPlugin, val schematic: Path) {
     private fun schematicBuildingFinishedCleanupRoutine() {
         // TODO: Logic to clear all files that might've been created by the schematic due to a server restart
 
+    }
+
+    fun onPluginDisable() {
+        states.forEach {
+            val serializedState: String = gson.toJson(it, SchematicState::class.java)
+        }
+    }
+
+    /**
+     * Used to keep track of the state of a schematic of this type being built
+     * later on serialized if the server is restarted to keep the schematic building.
+     */
+    data class SchematicState(
+            @Transient
+            val buildLocation: Location,
+            @Transient
+            val options: Set<SchematicOption>,
+            @Transient
+            var scheduler: BuildTask? = null,
+            var currentIndex: Int = 0,
+            @Transient
+            var builder: UUID? = null,
+            var finishedBuilding: Boolean = false,
+            var placeBlockEvery: Long = 20,
+            var blockPlacedCallback: (Location.(Unit, BuildTask) -> Unit)? = null,
+            var buildingFinishedCallback: ((BuildTask) -> Unit)? = null,
+            @Transient
+            var statefulBlockEncounterLocation: Location? = null,
+            @Transient
+            val uuid: UUID = UUID.randomUUID()
+    ) : Serializable {
+        fun destroy() {
+            scheduler = null
+            builder = null
+            blockPlacedCallback = null
+            buildingFinishedCallback = null
+        }
     }
 
     private fun Location.getSchematicBlockLocation(
@@ -332,10 +407,11 @@ class Schematic constructor(val plugin: JavaPlugin, val schematic: Path) {
         else -> null
     }
 
+
     /**
      * @return true if can build schematic, otherwise, false
      */
-    private fun validateBuildLocation(builder: Player? = null, locationsToValidate: MutableSet<Location>, vararg options: SchematicOption): Boolean {
+    private fun validateBuildLocation(builder: OfflinePlayer? = null, locationsToValidate: MutableSet<Location>, vararg options: SchematicOption): Boolean {
         if (options.contains(SchematicOption.OVERWRITE_BLOCKS) && !options.contains(SchematicOption.BUILD_PREVIEW)) {
             return true
         }
@@ -348,12 +424,12 @@ class Schematic constructor(val plugin: JavaPlugin, val schematic: Path) {
         locationsToValidate.forEachContextual {
             if (block.isPassable) {
                 if (showPreview) {
-                    builder?.sendBlockChange(this, limeGlassData)
+                    builder?.player?.sendBlockChange(this, limeGlassData)
                 }
                 validatedLocations.add(this)
             } else {
                 validatedLocations.forEach {
-                    builder?.sendBlockChange(it, airData)
+                    builder?.player?.sendBlockChange(it, airData)
                 }
                 return false
             }
@@ -361,7 +437,6 @@ class Schematic constructor(val plugin: JavaPlugin, val schematic: Path) {
 
         return true
     }
-
 
     private fun Player.getDirection(): BlockFace {
         var yaw = location.yaw
@@ -379,11 +454,11 @@ class Schematic constructor(val plugin: JavaPlugin, val schematic: Path) {
         val signData = blockDataToBePlaced as T
         block.blockData = signData
         if (locationsWithNBTData.containsKey(index)) {
-            val lines = locationsWithNBTData[index] as List<String>
+            val lines = locationsWithNBTData[index] as List<*>
             val sign = block.state as Sign
 
             lines.forEachIndexed { i, line ->
-                sign.setLine(i, line)
+                sign.setLine(i, line as String)
             }
 
             sign.update()
@@ -404,31 +479,19 @@ class Schematic constructor(val plugin: JavaPlugin, val schematic: Path) {
                 }
             BlockFace.EAST ->
                 when (face) {
-                    BlockFace.NORTH, BlockFace.SOUTH -> Direction.valueOf(face.toString()).next().face
-                    BlockFace.EAST, BlockFace.WEST -> Direction.valueOf(face.toString()).next(3).face
+                    BlockFace.NORTH, BlockFace.SOUTH -> DirectBlockFace.valueOf(face.toString()).next().blockFace
+                    BlockFace.EAST, BlockFace.WEST -> DirectBlockFace.valueOf(face.toString()).next(3).blockFace
                     else -> face
                 }
             BlockFace.WEST ->
                 when (face) {
-                    BlockFace.NORTH, BlockFace.SOUTH -> Direction.valueOf(face.toString()).next(3).face
-                    BlockFace.EAST, BlockFace.WEST -> Direction.valueOf(face.toString()).next().face
+                    BlockFace.NORTH, BlockFace.SOUTH -> DirectBlockFace.valueOf(face.toString()).next(3).blockFace
+                    BlockFace.EAST, BlockFace.WEST -> DirectBlockFace.valueOf(face.toString()).next().blockFace
                     else -> face
                 }
             else -> face
         }
     }
-
-    /**
-     * Used to keep track of the state of a schematic of this type being built
-     * later on serialized if the server is restarted to keep the schematic building.
-     */
-    class SchematicState {
-        var scheduler: BuildTask? = null
-        var currentIndex: Int = 0
-        var builderFace = BlockFace.NORTH
-    }
-
-    data class BuildResult(val blockLocations: Set<Location>, val success: Boolean)
 
     private inner class SchematicDimensions(val width: Short, val height: Short, val length: Short) {
 
@@ -439,181 +502,130 @@ class Schematic constructor(val plugin: JavaPlugin, val schematic: Path) {
         internal fun getBlockData(x: Int, y: Int, z: Int): BlockData {
             return getBlockData(getBlockIndex(x, y, z))
         }
+
         internal fun getBlockData(index: Int): BlockData {
             return blocks[blockData[index].toInt()]!!
         }
 
     }
-    enum class Direction(val face: BlockFace) {
-        NORTH(BlockFace.NORTH), EAST(BlockFace.EAST), SOUTH(BlockFace.SOUTH), WEST(BlockFace.WEST);
 
+    data class BuildResult(val blockLocations: Set<Location>, val success: Boolean)
+
+    companion object {
+        private val BLOCKS_PLACED_LAST: Set<Material> = setOf(
+                Material.LAVA,
+                Material.WATER,
+                Material.GRASS,
+                Material.ARMOR_STAND,
+                Material.TALL_GRASS,
+                Material.BLACK_BANNER,
+                Material.BLACK_WALL_BANNER,
+                Material.BLUE_BANNER,
+                Material.BLUE_WALL_BANNER,
+                Material.BROWN_BANNER,
+                Material.BROWN_WALL_BANNER,
+                Material.CYAN_BANNER,
+                Material.CYAN_WALL_BANNER,
+                Material.GRAY_BANNER,
+                Material.GRAY_WALL_BANNER,
+                Material.GREEN_BANNER,
+                Material.GREEN_WALL_BANNER,
+                Material.LIGHT_BLUE_BANNER,
+                Material.LIGHT_BLUE_WALL_BANNER,
+                Material.LIGHT_GRAY_BANNER,
+                Material.LIGHT_GRAY_WALL_BANNER,
+                Material.LIME_BANNER,
+                Material.LIME_WALL_BANNER,
+                Material.MAGENTA_BANNER,
+                Material.MAGENTA_WALL_BANNER,
+                Material.ORANGE_BANNER,
+                Material.ORANGE_WALL_BANNER,
+                Material.PINK_BANNER,
+                Material.PINK_WALL_BANNER,
+                Material.PURPLE_BANNER,
+                Material.PURPLE_WALL_BANNER,
+                Material.RED_BANNER,
+                Material.RED_WALL_BANNER,
+                Material.WHITE_BANNER,
+                Material.WHITE_WALL_BANNER,
+                Material.YELLOW_BANNER,
+                Material.YELLOW_WALL_BANNER,
+
+                Material.GRASS,
+                Material.TALL_GRASS,
+                Material.SEAGRASS,
+                Material.TALL_SEAGRASS,
+                Material.FLOWER_POT,
+                Material.SUNFLOWER,
+                Material.CHORUS_FLOWER,
+                Material.OXEYE_DAISY,
+                Material.DEAD_BUSH,
+                Material.FERN,
+                Material.DANDELION,
+                Material.POPPY,
+                Material.BLUE_ORCHID,
+                Material.ALLIUM,
+                Material.AZURE_BLUET,
+                Material.RED_TULIP,
+                Material.ORANGE_TULIP,
+                Material.WHITE_TULIP,
+                Material.PINK_TULIP,
+                Material.BROWN_MUSHROOM,
+                Material.RED_MUSHROOM,
+                Material.END_ROD,
+                Material.ROSE_BUSH,
+                Material.PEONY,
+                Material.LARGE_FERN,
+                Material.REDSTONE,
+                Material.REPEATER,
+                Material.COMPARATOR,
+                Material.LEVER,
+                Material.SEA_PICKLE,
+                Material.SUGAR_CANE,
+                Material.FIRE,
+                Material.WHEAT,
+                Material.WHEAT_SEEDS,
+                Material.CARROTS,
+                Material.BEETROOT,
+                Material.BEETROOT_SEEDS,
+                Material.MELON,
+                Material.MELON_STEM,
+                Material.MELON_SEEDS,
+                Material.POTATOES,
+                Material.PUMPKIN,
+                Material.PUMPKIN_STEM,
+                Material.PUMPKIN_SEEDS,
+                Material.TORCH,
+                Material.RAIL,
+                Material.ACTIVATOR_RAIL,
+                Material.DETECTOR_RAIL,
+                Material.POWERED_RAIL,
+
+                Material.ACACIA_FENCE,
+                Material.ACACIA_FENCE_GATE,
+                Material.BIRCH_FENCE,
+                Material.BIRCH_FENCE_GATE,
+                Material.DARK_OAK_FENCE,
+                Material.DARK_OAK_FENCE_GATE,
+                Material.JUNGLE_FENCE,
+                Material.JUNGLE_FENCE_GATE,
+                Material.NETHER_BRICK_FENCE,
+                Material.OAK_FENCE,
+                Material.OAK_FENCE_GATE,
+                Material.SPRUCE_FENCE,
+                Material.SPRUCE_FENCE_GATE,
+
+                Material.OAK_DOOR,
+                Material.ACACIA_DOOR,
+                Material.BIRCH_DOOR,
+                Material.DARK_OAK_DOOR,
+                Material.JUNGLE_DOOR,
+                Material.SPRUCE_DOOR,
+                Material.IRON_DOOR,
+
+                Material.IRON_BARS,
+
+                *MaterialType.MULTI_DIRECTIONAL.materials.toTypedArray()
+        )
     }
-
-    private val multiDirectionalMaterials: Set<Material> = setOf(
-            Material.STONE_BRICK_WALL,
-            Material.BRICK_WALL,
-            Material.ANDESITE_WALL,
-            Material.COBBLESTONE_WALL,
-            Material.DIORITE_WALL,
-            Material.END_STONE_BRICK_WALL,
-            Material.GRANITE_WALL,
-            Material.MOSSY_COBBLESTONE_WALL,
-            Material.MOSSY_STONE_BRICK_WALL,
-            Material.NETHER_BRICK_WALL,
-            Material.PRISMARINE_WALL,
-            Material.RED_NETHER_BRICK_WALL,
-            Material.RED_SANDSTONE_WALL,
-            Material.SANDSTONE_WALL
-    )
-
-    private val anvilMaterials: Set<Material> = setOf(
-            Material.ANVIL,
-            Material.CHIPPED_ANVIL,
-            Material.DAMAGED_ANVIL
-    )
-
-    private val signMaterials: Set<Material> = setOf(
-            Material.SPRUCE_SIGN,
-            Material.DARK_OAK_SIGN,
-            Material.ACACIA_SIGN,
-            Material.BIRCH_SIGN,
-            Material.JUNGLE_SIGN,
-            Material.OAK_SIGN
-    )
-
-    private val fenceTagValues: Set<Material> = Tag.FENCES.values
-
-
-    private val wallSignMaterials: Set<Material> = setOf(
-            Material.SPRUCE_WALL_SIGN,
-            Material.DARK_OAK_WALL_SIGN,
-            Material.ACACIA_WALL_SIGN,
-            Material.BIRCH_WALL_SIGN,
-            Material.JUNGLE_WALL_SIGN,
-            Material.OAK_WALL_SIGN
-    )
-    private val chestMaterials: Set<Material> = setOf(
-            Material.CHEST,
-            Material.TRAPPED_CHEST
-    )
-
-    private val blocksPlacedLast: Set<Material> = setOf(
-            Material.LAVA,
-            Material.WATER,
-            Material.GRASS,
-            Material.ARMOR_STAND,
-            Material.TALL_GRASS,
-            Material.BLACK_BANNER,
-            Material.BLACK_WALL_BANNER,
-            Material.BLUE_BANNER,
-            Material.BLUE_WALL_BANNER,
-            Material.BROWN_BANNER,
-            Material.BROWN_WALL_BANNER,
-            Material.CYAN_BANNER,
-            Material.CYAN_WALL_BANNER,
-            Material.GRAY_BANNER,
-            Material.GRAY_WALL_BANNER,
-            Material.GREEN_BANNER,
-            Material.GREEN_WALL_BANNER,
-            Material.LIGHT_BLUE_BANNER,
-            Material.LIGHT_BLUE_WALL_BANNER,
-            Material.LIGHT_GRAY_BANNER,
-            Material.LIGHT_GRAY_WALL_BANNER,
-            Material.LIME_BANNER,
-            Material.LIME_WALL_BANNER,
-            Material.MAGENTA_BANNER,
-            Material.MAGENTA_WALL_BANNER,
-            Material.ORANGE_BANNER,
-            Material.ORANGE_WALL_BANNER,
-            Material.PINK_BANNER,
-            Material.PINK_WALL_BANNER,
-            Material.PURPLE_BANNER,
-            Material.PURPLE_WALL_BANNER,
-            Material.RED_BANNER,
-            Material.RED_WALL_BANNER,
-            Material.WHITE_BANNER,
-            Material.WHITE_WALL_BANNER,
-            Material.YELLOW_BANNER,
-            Material.YELLOW_WALL_BANNER,
-
-            Material.GRASS,
-            Material.TALL_GRASS,
-            Material.SEAGRASS,
-            Material.TALL_SEAGRASS,
-            Material.FLOWER_POT,
-            Material.SUNFLOWER,
-            Material.CHORUS_FLOWER,
-            Material.OXEYE_DAISY,
-            Material.DEAD_BUSH,
-            Material.FERN,
-            Material.DANDELION,
-            Material.POPPY,
-            Material.BLUE_ORCHID,
-            Material.ALLIUM,
-            Material.AZURE_BLUET,
-            Material.RED_TULIP,
-            Material.ORANGE_TULIP,
-            Material.WHITE_TULIP,
-            Material.PINK_TULIP,
-            Material.BROWN_MUSHROOM,
-            Material.RED_MUSHROOM,
-            Material.END_ROD,
-            Material.ROSE_BUSH,
-            Material.PEONY,
-            Material.LARGE_FERN,
-            Material.REDSTONE,
-            Material.REPEATER,
-            Material.COMPARATOR,
-            Material.LEVER,
-            Material.SEA_PICKLE,
-            Material.SUGAR_CANE,
-            Material.FIRE,
-            Material.WHEAT,
-            Material.WHEAT_SEEDS,
-            Material.CARROTS,
-            Material.BEETROOT,
-            Material.BEETROOT_SEEDS,
-            Material.MELON,
-            Material.MELON_STEM,
-            Material.MELON_SEEDS,
-            Material.POTATOES,
-            Material.PUMPKIN,
-            Material.PUMPKIN_STEM,
-            Material.PUMPKIN_SEEDS,
-            Material.TORCH,
-            Material.RAIL,
-            Material.ACTIVATOR_RAIL,
-            Material.DETECTOR_RAIL,
-            Material.POWERED_RAIL,
-
-            Material.ACACIA_FENCE,
-            Material.ACACIA_FENCE_GATE,
-            Material.BIRCH_FENCE,
-            Material.BIRCH_FENCE_GATE,
-            Material.DARK_OAK_FENCE,
-            Material.DARK_OAK_FENCE_GATE,
-            Material.JUNGLE_FENCE,
-            Material.JUNGLE_FENCE_GATE,
-            Material.NETHER_BRICK_FENCE,
-            Material.OAK_FENCE,
-            Material.OAK_FENCE_GATE,
-            Material.SPRUCE_FENCE,
-            Material.SPRUCE_FENCE_GATE,
-
-            Material.OAK_DOOR,
-            Material.ACACIA_DOOR,
-            Material.BIRCH_DOOR,
-            Material.DARK_OAK_DOOR,
-            Material.JUNGLE_DOOR,
-            Material.SPRUCE_DOOR,
-            Material.IRON_DOOR,
-
-            Material.IRON_BARS,
-
-            *multiDirectionalMaterials.toTypedArray()
-    )
-}
-
-private enum class NBTMaterial {
-    SIGN, BANNER
 }

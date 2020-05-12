@@ -1,8 +1,10 @@
 package me.oriharel.machinery
 
-import me.oriharel.machinery.structure.schematic.Schematic
-import me.oriharel.machinery.utilities.extensions.scheduledIteration
+import com.google.gson.GsonBuilder
+import com.google.gson.reflect.TypeToken
+import me.oriharel.machinery.structure.schematic.*
 import me.oriharel.machinery.utilities.listen
+import me.oriharel.machinery.utilities.schedulers.IterativeScheduler
 import org.bukkit.event.block.BlockPlaceEvent
 import org.bukkit.plugin.java.JavaPlugin
 import java.nio.file.Files
@@ -17,10 +19,11 @@ class Machinery : JavaPlugin() {
         if (!Files.exists(dataFolder.toPath())) {
             Files.createFile(dataFolder.toPath())
         }
-
-        listOf<Int>(1, 2, 3, 4, 5, 6, 7, 8).scheduledIteration<Int, Unit>(this, 20) { index, ctx ->
-            print("NUMBER: $this, INDEX: $index")
-        }
+        val gson = GsonBuilder()
+                .registerTypeHierarchyAdapter(IterativeScheduler::class.java, BuildTaskTypeAdapter())
+                .registerTypeHierarchyAdapter(ByteArray::class.java, ByteArrayToBase64TypeAdapter())
+                .registerTypeHierarchyAdapter(Schematic.SchematicState::class.java, SchematicStateTypeAdapter())
+                .create()
 
         listen<BlockPlaceEvent>(
                 this
@@ -29,6 +32,7 @@ class Machinery : JavaPlugin() {
                     block.location,
                     player
             ) { index, loc, ctx ->
+                print(gson.toJson(ctx, object : TypeToken<BuildTask>() {}.type))
                 1L
             }
         }
