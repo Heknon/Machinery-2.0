@@ -1,4 +1,4 @@
-package me.oriharel.machinery.structure.schematic
+package me.oriharel.machinery.structure.schematic.utilities
 
 import com.google.gson.*
 import org.bukkit.craftbukkit.libs.org.apache.commons.codec.binary.Base64

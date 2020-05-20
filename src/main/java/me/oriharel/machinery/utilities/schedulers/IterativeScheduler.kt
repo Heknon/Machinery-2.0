@@ -2,8 +2,9 @@ package me.oriharel.machinery.utilities.schedulers
 
 import org.bukkit.plugin.java.JavaPlugin
 import org.bukkit.scheduler.BukkitTask
+import java.io.Serializable
 
-class IterativeScheduler<T, R>(private val iterated: Iterable<T>, plugin: JavaPlugin, period: Long, delay: Long) : Scheduler<T, Int, R>(plugin, iterated.count().toLong(), period, delay) {
+class IterativeScheduler<T, R>(private val iterated: Iterable<T>, plugin: JavaPlugin, period: Long, delay: Long) : Scheduler<T, Int, R>(plugin, iterated.count().toLong(), period, delay), Serializable {
     private val iterator: Iterator<IndexedValue<T>> = iterated.iterator().withIndex()
     var currentItem: IndexedValue<T>? = null
 

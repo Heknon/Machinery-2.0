@@ -1,8 +1,11 @@
 package me.oriharel.machinery
 
 import com.google.gson.GsonBuilder
-import com.google.gson.reflect.TypeToken
-import me.oriharel.machinery.structure.schematic.*
+import me.oriharel.machinery.structure.schematic.Schematic
+import me.oriharel.machinery.structure.schematic.SchematicImpl
+import me.oriharel.machinery.structure.schematic.SchematicOption
+import me.oriharel.machinery.structure.schematic.utilities.ByteArrayToBase64TypeAdapter
+import me.oriharel.machinery.structure.schematic.utilities.SchematicStateTypeAdapter
 import me.oriharel.machinery.utilities.listen
 import me.oriharel.machinery.utilities.schedulers.IterativeScheduler
 import org.bukkit.event.block.BlockPlaceEvent
@@ -10,6 +13,8 @@ import org.bukkit.plugin.java.JavaPlugin
 import java.nio.file.Files
 
 class Machinery : JavaPlugin() {
+
+    val schematicsBuildingRegistry: MutableList<Schematic> = mutableListOf()
 
     override fun onLoad() {
         INSTANCE = this
@@ -19,27 +24,30 @@ class Machinery : JavaPlugin() {
         if (!Files.exists(dataFolder.toPath())) {
             Files.createFile(dataFolder.toPath())
         }
+
         val gson = GsonBuilder()
-                .registerTypeHierarchyAdapter(IterativeScheduler::class.java, BuildTaskTypeAdapter())
                 .registerTypeHierarchyAdapter(ByteArray::class.java, ByteArrayToBase64TypeAdapter())
                 .registerTypeHierarchyAdapter(Schematic.SchematicState::class.java, SchematicStateTypeAdapter())
                 .create()
+        val schem = SchematicImpl(this@Machinery, dataFolder.toPath().resolve("miner.schem")).loadSchematic()
+        schematicsBuildingRegistry.add(schem)
 
         listen<BlockPlaceEvent>(
                 this
         ) {
-            Schematic(this@Machinery, dataFolder.toPath().resolve("miner.schem")).loadSchematic().buildSchematicEvaluatedTime(
+            schem.buildSchematic(
                     block.location,
-                    player
-            ) { index, loc, ctx ->
-                print(gson.toJson(ctx, object : TypeToken<BuildTask>() {}.type))
-                1L
-            }
+                    player,
+                    20,
+                    SchematicOption.PREVENT_BREAK_WHILE_BUILD
+            )
         }
     }
 
     override fun onDisable() {
-
+        schematicsBuildingRegistry.forEach {
+            it.onPluginDisable()
+        }
     }
 
     companion object {

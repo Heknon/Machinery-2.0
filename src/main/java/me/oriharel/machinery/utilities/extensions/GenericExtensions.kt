@@ -15,13 +15,13 @@ import java.io.Serializable
 import java.util.*
 import java.util.function.Consumer
 
-fun <T, A> T.execute(async: Boolean, plugin: JavaPlugin? = null, callback: ((A) -> Unit)? = null, executor: () -> A): T {
+fun <T, A> T.execute(async: Boolean, plugin: JavaPlugin? = null, executor: () -> A): T {
     if (async) {
         Bukkit.getScheduler().runTaskAsynchronously(plugin!!, Runnable {
-            callback?.invoke(executor())
+            executor()
         })
     } else {
-        callback?.invoke(executor())
+        executor()
     }
     return this
 }
@@ -49,10 +49,6 @@ fun <T> Collection<T>.removeUpTo(index: Int): Collection<T> {
         list.add(it)
     }
     return list
-}
-
-fun Consumer<*>.serialize(): ByteArray? {
-    return (this as Serializable).serialize()
 }
 
 fun Serializable.serialize(): ByteArray {

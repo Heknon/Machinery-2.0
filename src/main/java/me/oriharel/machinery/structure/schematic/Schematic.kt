@@ -1,7 +1,7 @@
 package me.oriharel.machinery.structure.schematic
 
 import com.google.gson.GsonBuilder
-import com.google.gson.reflect.TypeToken
+import me.oriharel.machinery.structure.schematic.utilities.*
 import me.oriharel.machinery.utilities.extensions.*
 import me.oriharel.machinery.utilities.schedulers.IterativeScheduler
 import net.minecraft.server.v1_15_R1.NBTCompressedStreamTools
@@ -19,7 +19,6 @@ import org.bukkit.entity.Player
 import org.bukkit.plugin.java.JavaPlugin
 import org.bukkit.util.Vector
 import java.io.FileInputStream
-import java.io.Serializable
 import java.nio.file.Path
 import java.util.*
 
@@ -35,54 +34,27 @@ typealias BuildTask = IterativeScheduler<Location, Unit>
  * of their data in the block however there will still be a file named "schematicsInProgress.dat" which will store the locations
  * to the stateful blocks as Longs. This file will be located in the appropriate world folder.
  */
-class Schematic constructor(val plugin: JavaPlugin, val schematic: Path) {
+abstract class Schematic(private val plugin: JavaPlugin, val schematic: Path) {
     private lateinit var blocks: MutableMap<Int, BlockData>
     private lateinit var blockData: ByteArray
     private lateinit var dimensions: SchematicDimensions
     private var chests: Map<Vector, MutableList<IndexedInventoryItem>>? = null
     private val signsInSchematic: MutableMap<Vector, List<String>> = HashMap()
     private val states: MutableSet<SchematicState> = mutableSetOf()
-    @Transient
-    private val gson = GsonBuilder()
+
+    protected val gson = GsonBuilder()
             .registerTypeHierarchyAdapter(ByteArray::class.java, ByteArrayToBase64TypeAdapter())
-            .registerTypeHierarchyAdapter(IterativeScheduler::class.java, BuildTaskTypeAdapter())
             .registerTypeHierarchyAdapter(SchematicState::class.java, SchematicStateTypeAdapter())
             .create()
 
 
-    /**
-     * Used when you want to have the time between each block placed changed while executing.
-     */
-    fun buildSchematicEvaluatedTime(
-            buildLocation: Location,
-            builder: Player? = null,
-            placeBlockEveryDefault: Long = 20,
-            blockPlacedCallback: (Location.(Unit, BuildTask) -> Unit)? = null,
-            buildingFinishedCallback: ((BuildTask) -> Unit)? = null,
-            options: Set<SchematicOption> = setOf(),
-            placeBlockEveryEvaluator: (Int, Location?, BuildTask) -> Long
-    ): BuildResult {
-        return buildSchematic(
-                buildLocation,
-                builder,
-                placeBlockEveryDefault,
-                { ret, ctx ->
-                    if (ctx is IterativeScheduler<Location, Unit>)
-                        ctx.update(period = 0, delay = placeBlockEveryEvaluator(ctx.currentItem?.index
-                                ?: 0, ctx.currentItem?.value, ctx))
-                    blockPlacedCallback?.invoke(this, ret, ctx)
-                },
-                buildingFinishedCallback,
-                *options.toTypedArray()
-        )
-    }
+    abstract fun blockPlaced(loc: Location, state: SchematicState, ctx: BuildTask)
+    abstract fun buildingFinished(ctx: BuildTask, state: SchematicState)
 
     fun buildSchematic(
             buildLocation: Location,
             builder: OfflinePlayer? = null,
             placeBlockEvery: Long = 20,
-            blockPlacedCallback: (Location.(Unit, BuildTask) -> Unit)? = null,
-            buildingFinishedCallback: ((BuildTask) -> Unit)? = null,
             vararg options: SchematicOption
     ): BuildResult {
         return buildSchematic(SchematicState(
@@ -92,9 +64,7 @@ class Schematic constructor(val plugin: JavaPlugin, val schematic: Path) {
                 currentIndex = 0,
                 builder = builder?.uniqueId,
                 finishedBuilding = false,
-                placeBlockEvery = placeBlockEvery,
-                blockPlacedCallback = blockPlacedCallback,
-                buildingFinishedCallback = buildingFinishedCallback
+                placeBlockEvery = placeBlockEvery
         ))
     }
 
@@ -144,7 +114,10 @@ class Schematic constructor(val plugin: JavaPlugin, val schematic: Path) {
         placementLocations.addAll(placementLocationsPlacedLast)
         placementLocationsPlacedLast.clear()
 
-        if (!validateBuildLocation(builder, placementLocations, *schematicState.options.toTypedArray())) return BuildResult(placementLocations, false)
+        if (schematicState.options.contains(SchematicOption.PREVENT_BREAK_WHILE_BUILD) && this is BlockableSchematic)
+            interactionBlocker.addUninteractableLocations(*placementLocations.toTypedArray())
+
+        if (!validateBuildLocation(builder, placementLocations, *schematicState.options.toTypedArray())) return BuildResult(placementLocations, false, schematicState)
 
         val blocksToUpdateAfterPaste: MutableList<Block> = mutableListOf()
 
@@ -171,7 +144,7 @@ class Schematic constructor(val plugin: JavaPlugin, val schematic: Path) {
                             schematicState.statefulBlockEncounterLocation = it.location
                         }
                         schematicState.currentIndex++
-                    }.setOnSingleTaskComplete { ret, ctx ->
+                    }.setOnSingleTaskComplete { _, ctx ->
 
                         if (schematicState.options.contains(SchematicOption.PLAY_DEFAULT_SOUND)) {
                             block.location.world?.playEffect(block.location, Effect.STEP_SOUND, block.type)
@@ -181,19 +154,19 @@ class Schematic constructor(val plugin: JavaPlugin, val schematic: Path) {
                             block.location.world?.spawnParticle(Particle.CLOUD, block.location, 6)
                         }
 
-                        schematicState.blockPlacedCallback?.invoke(this, ret, ctx as BuildTask)
+                        blockPlaced(this, schematicState, ctx as BuildTask)
 
                     }.setOnRepeatComplete {
                         buildFinalizationRoutine(blocksToUpdateAfterPaste)
                         schematicBuildingFinishedCleanupRoutine()
-                        schematicState.buildingFinishedCallback?.invoke(this as BuildTask)
-                        schematicState.destroy()
+                        buildingFinished(this as BuildTask, schematicState)
+                        states.remove(schematicState)
                     } as BuildTask
         } else {
             schematicState.scheduler!!.run()
         }
 
-        return BuildResult(placementLocations, true)
+        return BuildResult(placementLocations, true, schematicState)
     }
 
     fun loadSchematic(): Schematic {
@@ -263,10 +236,11 @@ class Schematic constructor(val plugin: JavaPlugin, val schematic: Path) {
 
                 if (locationsWithNBTData.containsKey(index)) {
 
-                    val items: MutableList<IndexedInventoryItem> = locationsWithNBTData[index] as MutableList<IndexedInventoryItem>
+                    val items: MutableList<*> = locationsWithNBTData[index] as MutableList<*>
                     val chest = block.state as Chest
 
                     for (indexItem in items) {
+                        if (indexItem !is IndexedInventoryItem) continue
                         chest.blockInventory.setItem(indexItem.index, indexItem.item)
                     }
                 }
@@ -340,6 +314,7 @@ class Schematic constructor(val plugin: JavaPlugin, val schematic: Path) {
     fun onPluginDisable() {
         states.forEach {
             val serializedState: String = gson.toJson(it, SchematicState::class.java)
+            print(serializedState)
         }
     }
 
@@ -348,31 +323,22 @@ class Schematic constructor(val plugin: JavaPlugin, val schematic: Path) {
      * later on serialized if the server is restarted to keep the schematic building.
      */
     data class SchematicState(
-            @Transient
+
             val buildLocation: Location,
-            @Transient
+
             val options: Set<SchematicOption>,
-            @Transient
+
             var scheduler: BuildTask? = null,
             var currentIndex: Int = 0,
-            @Transient
+
             var builder: UUID? = null,
             var finishedBuilding: Boolean = false,
             var placeBlockEvery: Long = 20,
-            var blockPlacedCallback: (Location.(Unit, BuildTask) -> Unit)? = null,
-            var buildingFinishedCallback: ((BuildTask) -> Unit)? = null,
-            @Transient
+
             var statefulBlockEncounterLocation: Location? = null,
-            @Transient
+
             val uuid: UUID = UUID.randomUUID()
-    ) : Serializable {
-        fun destroy() {
-            scheduler = null
-            builder = null
-            blockPlacedCallback = null
-            buildingFinishedCallback = null
-        }
-    }
+    )
 
     private fun Location.getSchematicBlockLocation(
             face: BlockFace,
@@ -493,7 +459,7 @@ class Schematic constructor(val plugin: JavaPlugin, val schematic: Path) {
         }
     }
 
-    private inner class SchematicDimensions(val width: Short, val height: Short, val length: Short) {
+    inner class SchematicDimensions(val width: Short, val height: Short, val length: Short) {
 
         internal fun getBlockIndex(x: Int, y: Int, z: Int): Int {
             return (y * width * length) + (z * width) + x
@@ -509,7 +475,7 @@ class Schematic constructor(val plugin: JavaPlugin, val schematic: Path) {
 
     }
 
-    data class BuildResult(val blockLocations: Set<Location>, val success: Boolean)
+    data class BuildResult(val blockLocations: Set<Location>, val success: Boolean, val state: SchematicState)
 
     companion object {
         private val BLOCKS_PLACED_LAST: Set<Material> = setOf(

@@ -11,7 +11,7 @@ import java.util.function.Consumer
  * @param R the return type of a task. These are accumulated to then be sent in the callback as a list of all the returns
  */
 abstract class Scheduler<T, P, R>(private val plugin: JavaPlugin, private var repeatAmount: Long, internal var period: Long, private var delay: Long) {
-    private var taskConsumer: Consumer<BukkitTask>? = null
+    private var taskConsumer: ((BukkitTask) -> Unit)? = null
     private var task: BukkitTask? = null
     private var onSingleTaskComplete: (T.(R, Scheduler<T, P, R>) -> Unit)? = null
     private var onRepeatComplete: (Scheduler<T, P, R>.(List<R>) -> Unit)? = null
@@ -21,7 +21,7 @@ abstract class Scheduler<T, P, R>(private val plugin: JavaPlugin, private var re
     private var repeatedAmount: Long = 0
 
     fun setTask(task: T.(P, Scheduler<T, P, R>) -> R): Scheduler<T, P, R> {
-        taskConsumer = Consumer {
+        taskConsumer = Consumer@ {
             if (!mounted) {
                 this.task = it
                 mounted = true

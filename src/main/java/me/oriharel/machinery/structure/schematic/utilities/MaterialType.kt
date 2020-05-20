@@ -1,4 +1,4 @@
-package me.oriharel.machinery.structure.schematic
+package me.oriharel.machinery.structure.schematic.utilities
 
 import org.bukkit.Material
 import org.bukkit.Tag
