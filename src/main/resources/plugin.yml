@@ -2,6 +2,7 @@ name: Machinery
 version: ${project.version}
 main: me.oriharel.machinery.Machinery
 api-version: 1.13
+load: POSTWORLD
 authors: [Heknon]
 depend:
   - Kotlin

@@ -9,6 +9,9 @@ class IterativeScheduler<T, R>(private val iterated: Iterable<T>, plugin: JavaPl
     var currentItem: IndexedValue<T>? = null
 
     override fun taskExecutor(task: T.(Int, Scheduler<T, Int, R>) -> R, ctx: BukkitTask): Pair<Boolean, R?> {
+        if (!iterator.hasNext()) {
+            return Pair(false, null)
+        }
         var indexed = iterator.next()
         while (indexed.index < currentItem?.index ?: -1 && iterator.hasNext()) {
             indexed = iterator.next()

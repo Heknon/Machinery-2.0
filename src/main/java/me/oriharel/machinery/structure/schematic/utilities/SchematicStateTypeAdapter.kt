@@ -2,11 +2,11 @@ package me.oriharel.machinery.structure.schematic.utilities
 
 import com.google.gson.*
 import com.google.gson.reflect.TypeToken
-import me.oriharel.machinery.structure.schematic.BuildTask
 import me.oriharel.machinery.structure.schematic.Schematic
 import me.oriharel.machinery.structure.schematic.SchematicOption
 import me.oriharel.machinery.utilities.extensions.*
 import org.bukkit.Location
+import org.bukkit.block.BlockFace
 import java.lang.reflect.Type
 import java.util.*
 
@@ -21,10 +21,9 @@ class SchematicStateTypeAdapter : JsonSerializer<Schematic.SchematicState>, Json
         obj.add("builder", state.builder?.toJsonElement())
         obj.add("finishedBuilding", JsonPrimitive(state.finishedBuilding))
         obj.add("placeBlockEvery", JsonPrimitive(state.placeBlockEvery))
-        obj.add("statefulBlockEncounterLocation", JsonPrimitive(state.statefulBlockEncounterLocation?.compress()
-                ?: -1L))
-        obj.add("statefulBlockEncounterLocationWorld", state.statefulBlockEncounterLocation?.world?.uid?.toJsonElement())
         obj.add("uuid", state.uuid.toJsonElement())
+        obj.add("originalFacing", ctx.serialize(state.originalFacing, BlockFace::class.java))
+        obj.add("placementLocations", ctx.serialize(state.placementLocations, object : TypeToken<MutableSet<Location>>() {}.type))
 
         return obj
     }
@@ -38,8 +37,9 @@ class SchematicStateTypeAdapter : JsonSerializer<Schematic.SchematicState>, Json
         val builder: UUID? = obj.get("builder").toUUID()
         val finishedBuilding: Boolean = obj.get("finishedBuilding").asBoolean
         val placeBlockEvery: Long = obj.get("placeBlockEvery").asLong
-        val statefulBlockEncounterLocation: Location? = obj.get("statefulBlockEncounterLocation").asLong.decompress(obj.get("statefulBlockEncounterLocationWorld").toUUID().toWorld())
         val uuid = obj.get("uuid").toUUID()
+        val placementLocations: MutableSet<Location> = ctx.deserialize(obj.get("placementLocations"), object : TypeToken<MutableSet<Location>>() {}.type)
+        val originalFacing: BlockFace = ctx.deserialize(obj.get("originalFacing"), BlockFace::class.java)
 
         return Schematic.SchematicState(
                 buildLocation = buildLocation,
@@ -48,8 +48,9 @@ class SchematicStateTypeAdapter : JsonSerializer<Schematic.SchematicState>, Json
                 builder = builder,
                 finishedBuilding = finishedBuilding,
                 placeBlockEvery = placeBlockEvery,
-                statefulBlockEncounterLocation = statefulBlockEncounterLocation,
-                uuid = uuid
+                uuid = uuid,
+                originalFacing = originalFacing,
+                placementLocations = placementLocations
         )
     }
 }

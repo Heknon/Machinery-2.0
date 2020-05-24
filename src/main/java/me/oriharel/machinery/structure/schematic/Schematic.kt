@@ -14,11 +14,15 @@ import org.bukkit.block.data.Directional
 import org.bukkit.block.data.MultipleFacing
 import org.bukkit.block.data.type.Fence
 import org.bukkit.block.data.type.WallSign
+import org.bukkit.configuration.file.YamlConfiguration
+import org.bukkit.craftbukkit.libs.org.apache.commons.codec.binary.Base64
 import org.bukkit.craftbukkit.libs.org.apache.commons.lang3.EnumUtils
 import org.bukkit.entity.Player
 import org.bukkit.plugin.java.JavaPlugin
 import org.bukkit.util.Vector
+import java.io.File
 import java.io.FileInputStream
+import java.nio.file.Files
 import java.nio.file.Path
 import java.util.*
 
@@ -42,10 +46,10 @@ abstract class Schematic(private val plugin: JavaPlugin, val schematic: Path) {
     private val signsInSchematic: MutableMap<Vector, List<String>> = HashMap()
     private val states: MutableSet<SchematicState> = mutableSetOf()
 
-    protected val gson = GsonBuilder()
-            .registerTypeHierarchyAdapter(ByteArray::class.java, ByteArrayToBase64TypeAdapter())
-            .registerTypeHierarchyAdapter(SchematicState::class.java, SchematicStateTypeAdapter())
-            .create()
+    val isLoaded: Boolean
+        get() {
+            return this::dimensions.isInitialized
+        }
 
 
     abstract fun blockPlaced(loc: Location, state: SchematicState, ctx: BuildTask)
@@ -64,7 +68,8 @@ abstract class Schematic(private val plugin: JavaPlugin, val schematic: Path) {
                 currentIndex = 0,
                 builder = builder?.uniqueId,
                 finishedBuilding = false,
-                placeBlockEvery = placeBlockEvery
+                placeBlockEvery = placeBlockEvery,
+                originalFacing = builder?.player?.getDirection() ?: BlockFace.NORTH
         ))
     }
 
@@ -72,54 +77,64 @@ abstract class Schematic(private val plugin: JavaPlugin, val schematic: Path) {
             schematicState: SchematicState
     ): BuildResult {
         states.add(schematicState)
+        println("BUILDING STATE: $schematicState")
         val width = dimensions.width.toInt()
         val height = dimensions.height.toInt()
         val length = dimensions.length.toInt()
         val builder: OfflinePlayer? = schematicState.builder?.toOfflinePlayer()
+        val builderFacing: BlockFace = schematicState.originalFacing
         val placementLocations: MutableSet<Location> = mutableSetOf()
         val placementLocationsPlacedLast: MutableSet<Location> = mutableSetOf()
         val locationsWithNBTData: MutableMap<Int, Any?> = mutableMapOf()
-        val builderFacing: BlockFace = builder?.player?.getDirection() ?: BlockFace.NORTH
         val indices: MutableList<Int> = mutableListOf()
         val indicesPlacedLast: MutableList<Int> = mutableListOf()
 
-        for (widthCurr in 0 until width)
-            for (heightCurr in 0 until height)
-                for (lengthCurr in 0 until length) {
-                    val blockIndex = dimensions.getBlockIndex(widthCurr, heightCurr, lengthCurr)
-                    val blockData = dimensions.getBlockData(widthCurr, heightCurr, lengthCurr)
-                    val location: Location = schematicState.buildLocation.getSchematicBlockLocation(builderFacing, widthCurr, heightCurr, lengthCurr)!!
-                    val point = Vector(widthCurr, heightCurr, lengthCurr)
+        if (schematicState.placementLocations == null) {
+            for (widthCurr in 0 until width)
+                for (heightCurr in 0 until height)
+                    for (lengthCurr in 0 until length) {
+                        val blockIndex = dimensions.getBlockIndex(widthCurr, heightCurr, lengthCurr)
+                        val blockData = dimensions.getBlockData(widthCurr, heightCurr, lengthCurr)
+                        val location: Location = schematicState.buildLocation.getSchematicBlockLocation(builderFacing, widthCurr, heightCurr, lengthCurr)!!
+                        val point = Vector(widthCurr, heightCurr, lengthCurr)
 
 
-                    val blockMaterial = blockData.material
-                    if (blockMaterial != Material.AIR)
-                        if (!BLOCKS_PLACED_LAST.contains(blockMaterial)) {
-                            indices.add(blockIndex)
-                            placementLocations.add(location)
-                        } else {
-                            indicesPlacedLast.add(blockIndex)
-                            placementLocationsPlacedLast.add(location)
-                        }
+                        val blockMaterial = blockData.material
+                        if (blockMaterial != Material.AIR)
+                            if (!BLOCKS_PLACED_LAST.contains(blockMaterial)) {
+                                indices.add(blockIndex)
+                                placementLocations.add(location)
+                            } else {
+                                indicesPlacedLast.add(blockIndex)
+                                placementLocationsPlacedLast.add(location)
+                            }
 
 
 
-                    if (signsInSchematic.containsKey(point)) locationsWithNBTData[blockIndex] = signsInSchematic[point]
-                    if (chests?.containsKey(point) == true) locationsWithNBTData[blockIndex] = chests?.get(point)
-                }
+                        if (signsInSchematic.containsKey(point)) locationsWithNBTData[blockIndex] = signsInSchematic[point]
+                        if (chests?.containsKey(point) == true) locationsWithNBTData[blockIndex] = chests?.get(point)
+                    }
+            indices.addAll(indicesPlacedLast)
+            indicesPlacedLast.clear()
 
-        indices.addAll(indicesPlacedLast)
-        indicesPlacedLast.clear()
+            placementLocations.addAll(placementLocationsPlacedLast)
+            placementLocationsPlacedLast.clear()
+            schematicState.placementLocations = placementLocations
+        }
 
-        placementLocations.addAll(placementLocationsPlacedLast)
-        placementLocationsPlacedLast.clear()
+
+
 
         if (schematicState.options.contains(SchematicOption.PREVENT_BREAK_WHILE_BUILD) && this is BlockableSchematic)
-            interactionBlocker.addUninteractableLocations(*placementLocations.toTypedArray())
+            interactionBlocker.addUninteractableLocations(*schematicState.placementLocations!!.toTypedArray())
 
-        if (!validateBuildLocation(builder, placementLocations, *schematicState.options.toTypedArray())) return BuildResult(placementLocations, false, schematicState)
+        if (!validateBuildLocation(builder, schematicState.placementLocations!!, *schematicState.options.toTypedArray())) {
+            println("c")
+            return BuildResult(placementLocations, false, schematicState)
+        }
 
         val blocksToUpdateAfterPaste: MutableList<Block> = mutableListOf()
+        println("a")
 
         placementLocations.forEachIndexed { i, location ->
             val block = location.block
@@ -129,9 +144,9 @@ abstract class Schematic(private val plugin: JavaPlugin, val schematic: Path) {
                 blocksToUpdateAfterPaste.add(block)
         }
 
-        schematicState.finishedBuilding = true
+        println("STATE: $schematicState")
         if (schematicState.scheduler == null) {
-            schematicState.scheduler = placementLocations.removeUpTo(if (schematicState.currentIndex == 0) 0 else schematicState.currentIndex + 1)
+            schematicState.scheduler = placementLocations
                     .scheduledIteration<Location, Unit>(plugin, schematicState.placeBlockEvery) { _, _ ->
                         blockPlacementRoutine(
                                 builderFacing,
@@ -139,10 +154,8 @@ abstract class Schematic(private val plugin: JavaPlugin, val schematic: Path) {
                                 dimensions.getBlockData(indices[schematicState.currentIndex]),
                                 locationsWithNBTData,
                                 schematicState.currentIndex
-                        ).also {
-                            if (schematicState.statefulBlockEncounterLocation != null && it.state !is TileState) return@also
-                            schematicState.statefulBlockEncounterLocation = it.location
-                        }
+                        )
+                        schematicState.placementLocations!!.remove(this)
                         schematicState.currentIndex++
                     }.setOnSingleTaskComplete { _, ctx ->
 
@@ -158,8 +171,9 @@ abstract class Schematic(private val plugin: JavaPlugin, val schematic: Path) {
 
                     }.setOnRepeatComplete {
                         buildFinalizationRoutine(blocksToUpdateAfterPaste)
-                        schematicBuildingFinishedCleanupRoutine()
+                        schematicBuildingFinishedCleanupRoutine(schematicState)
                         buildingFinished(this as BuildTask, schematicState)
+                        schematicState.finishedBuilding = true
                         states.remove(schematicState)
                     } as BuildTask
         } else {
@@ -306,15 +320,31 @@ abstract class Schematic(private val plugin: JavaPlugin, val schematic: Path) {
     }
 
 
-    private fun schematicBuildingFinishedCleanupRoutine() {
-        // TODO: Logic to clear all files that might've been created by the schematic due to a server restart
+    private fun schematicBuildingFinishedCleanupRoutine(state: SchematicState) {
+        val parentFolder = state.buildLocation.world!!.worldFolder.toPath().resolve("schematics")
+        val file = parentFolder.resolve("${Base64.encodeBase64String(schematic.toAbsolutePath().toString().toByteArray())}_save.yml")
 
+        val yaml = YamlConfiguration.loadConfiguration(file.toFile())
+        val path = state.uuid.toString().replace("-", "")
+        yaml.set(path, null)
+        yaml.save(file.toFile())
     }
 
     fun onPluginDisable() {
         states.forEach {
-            val serializedState: String = gson.toJson(it, SchematicState::class.java)
-            print(serializedState)
+            if (it.finishedBuilding) return@forEach
+
+            val parentFolder = it.buildLocation.world!!.worldFolder.toPath().resolve("schematics")
+            val file = parentFolder.resolve("${Base64.encodeBase64String(schematic.toAbsolutePath().toString().toByteArray())}_save.yml")
+
+            if (!Files.exists(parentFolder)) Files.createDirectory(parentFolder)
+            if (!Files.exists(file)) Files.createFile(file)
+
+            val yaml = YamlConfiguration.loadConfiguration(file.toFile())
+            val path = it.uuid.toString().replace("-", "")
+            yaml.createSection(path)
+            yaml.set(path, gson.toJson(it, SchematicState::class.java))
+            yaml.save(file.toFile())
         }
     }
 
@@ -332,10 +362,11 @@ abstract class Schematic(private val plugin: JavaPlugin, val schematic: Path) {
             var currentIndex: Int = 0,
 
             var builder: UUID? = null,
+            var originalFacing: BlockFace = BlockFace.NORTH,
             var finishedBuilding: Boolean = false,
             var placeBlockEvery: Long = 20,
 
-            var statefulBlockEncounterLocation: Location? = null,
+            var placementLocations: MutableSet<Location>? = null,
 
             val uuid: UUID = UUID.randomUUID()
     )
@@ -377,7 +408,7 @@ abstract class Schematic(private val plugin: JavaPlugin, val schematic: Path) {
     /**
      * @return true if can build schematic, otherwise, false
      */
-    private fun validateBuildLocation(builder: OfflinePlayer? = null, locationsToValidate: MutableSet<Location>, vararg options: SchematicOption): Boolean {
+    private fun validateBuildLocation(builder: OfflinePlayer? = null, locationsToValidate: Set<Location>, vararg options: SchematicOption): Boolean {
         if (options.contains(SchematicOption.OVERWRITE_BLOCKS) && !options.contains(SchematicOption.BUILD_PREVIEW)) {
             return true
         }
@@ -394,6 +425,7 @@ abstract class Schematic(private val plugin: JavaPlugin, val schematic: Path) {
                 }
                 validatedLocations.add(this)
             } else {
+                println("FAILED AT: $this")
                 validatedLocations.forEach {
                     builder?.player?.sendBlockChange(it, airData)
                 }
@@ -478,6 +510,41 @@ abstract class Schematic(private val plugin: JavaPlugin, val schematic: Path) {
     data class BuildResult(val blockLocations: Set<Location>, val success: Boolean, val state: SchematicState)
 
     companion object {
+        @JvmStatic
+        protected val gson = GsonBuilder()
+                .registerTypeHierarchyAdapter(ByteArray::class.java, ByteArrayToBase64TypeAdapter())
+                .registerTypeHierarchyAdapter(SchematicState::class.java, SchematicStateTypeAdapter())
+                .create()
+
+        /**
+         * schematics loaded
+         */
+        fun onPluginEnable(plugin: JavaPlugin, schematicSupplier: (JavaPlugin, Path) -> Schematic): Map<Path, Schematic> {
+            val schematics: MutableMap<Path, Schematic> = mutableMapOf()
+            Bukkit.getWorlds().forEach {
+                val parentFolder = it.worldFolder.toPath().resolve("schematics")
+
+                if (!Files.exists(parentFolder)) return@forEach
+                println("PASSED. SEARCHING...")
+                parentFolder.searchForFilesWithExtension(".yml").forEach { path ->
+                    val pathToSchematic = File(String(Base64.decodeBase64(path.fileName.toString().split("_save")[0]))).toPath()
+                    val schematic: Schematic
+                    if (schematics.containsKey(pathToSchematic)) {
+                        schematic = schematics[pathToSchematic]!!
+                    } else {
+                        schematic = schematicSupplier(plugin, pathToSchematic)
+                        schematic.loadSchematic()
+                    }
+
+                    val yaml = YamlConfiguration.loadConfiguration(path.toFile())
+                    yaml.getValues(false).forEach { entry ->
+                        schematic.buildSchematic(gson.fromJson(entry.value as String, SchematicState::class.java))
+                    }
+                }
+            }
+            return schematics
+        }
+
         private val BLOCKS_PLACED_LAST: Set<Material> = setOf(
                 Material.LAVA,
                 Material.WATER,
